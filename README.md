@@ -59,18 +59,20 @@ python -m doc2md.convert \
 
 #### Conversion methods
 
-`--conversion-method` chooses how each file is turned into Markdown. There are two backends:
+`--conversion-method` chooses how each file is turned into Markdown. There are two primary backends:
 
-- **VLM**: renders every page to an image and OCRs it with the vLLM server.
-- **anydoc**: reads text straight from the source file. There's no OCR, and the output has no page markers.
+- **VLM**: renders every page to an image and OCRs it with the vLLM server (requires external tools, see below).
+- **anydoc**: reads text straight from the source file.
+
+We strongly recommend using `vlm` (default). This is slower than `auto`/`native`, but it works well on all file types and produces a universal output format with high-quality output.
 
 | method | PDF | TIFF | Office / OpenDocument |
 |---|---|---|---|
-| `auto` (default) | VLM | VLM | anydoc |
-| `vlm` | VLM | VLM | LibreOffice → PDF → VLM |
+| `vlm` (default) | VLM | VLM | LibreOffice → PDF → VLM |
+| `auto` | VLM | VLM | anydoc |
 | `native` | anydoc (text layer only) | fails: anydoc can't read TIFF | anydoc |
 
-Office / OpenDocument means `.doc .docx .docm .dotx .dotm .odt .rtf`, `.xls .xlsx .xlsm .xltx .ods` and `.ppt .pptx .pptm .ppsx .potx .odp`.
+Supported file types for Office / OpenDocument include `.doc`, `.docx`, `.docm`, `.dotx`, `.dotm`, `.odt`, `.rtf`, `.xls`, `.xlsx`, `.xlsm`, `.xltx`, `.ods`, `.ppt`, `.pptx`, `.pptm`, `.ppsx`, `.potx`, `.odp`.
 
 External tools are needed only for files that go to the VLM:
 
