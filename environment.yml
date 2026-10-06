@@ -1,0 +1,10 @@
+name: doc2md
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - poppler
+  - pip
+  - pip:
+      - -e .[dev]

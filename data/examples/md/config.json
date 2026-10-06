@@ -1,0 +1,16 @@
+{
+  "base_url": "http://localhost:8001",
+  "concurrency": 8,
+  "conversion_method": "vlm",
+  "force": false,
+  "input_dir": "data/examples/raw",
+  "max_retries": 2,
+  "max_tokens": 8192,
+  "model": "lightonai/LightOnOCR-2-1B-bbox-soup",
+  "output_dir": "data/examples/md",
+  "page_image_cache": null,
+  "target_px": 1540,
+  "temperature": 0.0,
+  "top_p": 0.9,
+  "verbose": false
+}
