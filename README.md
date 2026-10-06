@@ -16,6 +16,7 @@ Where the trailing numbers are the bounding box coordinates of the image in the 
 
 In our tests, this model produced the best results for complex documents with tables, figures, and multi-column layouts. See the [paper](https://arxiv.org/pdf/2601.14251) for more details on the model and its training.
 
+
 ## Setup
 
 ```bash
@@ -25,6 +26,7 @@ bash scripts/setup_libreoffice.sh     # only needed for --conversion-method vlm 
 cp .env.example .env                  # add HF_TOKEN, used by docker/*/serve.sh for gated models
 pytest -m "not vllm"                  # offline tests
 ```
+
 
 ## Pipeline
 
@@ -126,6 +128,22 @@ python -m doc2md.caption \
 ```
 
 `--model` takes a bare Hugging Face-style name (e.g. `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8`, the default); it's checked against `--base-url` and routed to the local vLLM server automatically. Any other LiteLLM provider string (e.g. `anthropic/claude-3-5-sonnet`) should work too.
+
+
+## Hardware requirements
+
+This tool has been developed and tested on a NVIDIA DGX Spark with a single GB10 GPU. Docker containers are provided for serving the VLMs with `vLLM`. All VLM calls assume an OpenAI-compatible API endpoint, so alternative endpoints can be used if needed. For example, to run the text extraction step with a model served with `ollama`, simply set `--base-url http://localhost:11434/v1` and `--model ollama_model_name` to point to your local Ollama server, e.g.
+
+```bash
+python -m doc2md.convert \
+    -i data/examples/raw \
+    -o data/examples/md-ollama \
+    --base-url http://localhost:11434 \
+    --model maternion/LightOnOCR-2 \
+    --conversion-method vlm
+```
+
+**NOTE:** if using a quantized model through `ollama`, extraction quality may be lower than the original model.
 
 
 ## Acknowledgements
