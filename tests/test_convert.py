@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import anydoc
 import httpx
@@ -28,10 +29,12 @@ from doc2md.convert import (
     convert_native,
     convert_pages_vlm,
     explain_native_failure,
+    iter_pdf_pages,
     ocr_page,
     process_one_file,
     render_pages,
     resolve_conversion_method,
+    save_pages,
 )
 
 requires_poppler = pytest.mark.skipif(
@@ -252,6 +255,51 @@ def test_convert_pages_vlm_preserves_page_order_under_concurrency(tmp_path):
     assert idx1 < idx2 < idx3
 
 
+def test_convert_pages_vlm_encodes_a_page_only_while_holding_a_slot(
+    tmp_path, monkeypatch
+):
+    page_paths = []
+    for i in range(4):
+        p = tmp_path / f"p{i + 1:06d}-000004.png"
+        _write_page(p, size=(100, 100))
+        page_paths.append(p)
+
+    opened: list[Path] = []
+    real_open = Image.open
+
+    def counting_open(path, *args, **kwargs):
+        opened.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(convert_mod.Image, "open", counting_open)
+    pages_opened_at_post: list[int] = []
+
+    class SlowClient(FakeOCRClient):
+        async def post(self, url, json):
+            await asyncio.sleep(0.05)  # gives waiting pages time to run if they could
+            pages_opened_at_post.append(len(opened))
+            return FakeResponse(200, {"choices": [{"message": {"content": "text"}}]})
+
+    asyncio.run(
+        convert_pages_vlm(
+            page_paths,
+            cast(httpx.AsyncClient, SlowClient()),
+            asyncio.Semaphore(1),
+            base_url="http://fake",
+            model="m",
+            max_tokens=64,
+            temperature=0.2,
+            top_p=0.9,
+            target_px=64,
+            max_retries=1,
+            source_name="doc",
+        )
+    )
+
+    # with one slot, page N is only opened after pages 1..N-1 finished their OCR call
+    assert pages_opened_at_post == [1, 2, 3, 4]
+
+
 def _make_docx(path, text="Hello from a synthesized docx fixture."):
     import docx
 
@@ -333,6 +381,78 @@ def test_render_pages_tiff_caches_native_resolution(tmp_path):
     for p in paths:
         cached = Image.open(p)
         assert cached.size == (400, 500)  # native resolution, not pre-downscaled
+
+
+@requires_poppler
+def test_iter_pdf_pages_renders_in_chunks(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_multipage_pdf(pdf_path, n_pages=5)
+    calls = []
+    real_convert_from_path = convert_mod.convert_from_path
+
+    def recording_convert_from_path(path, **kwargs):
+        calls.append((kwargs["first_page"], kwargs["last_page"]))
+        return real_convert_from_path(path, **kwargs)
+
+    monkeypatch.setattr(convert_mod, "convert_from_path", recording_convert_from_path)
+
+    pages = list(iter_pdf_pages(pdf_path, 5, dpi=50, chunk_pages=2))
+
+    assert len(pages) == 5
+    assert calls == [(1, 2), (3, 4), (5, 5)]
+
+
+def test_save_pages_names_files_with_total_and_keeps_order(tmp_path):
+    images = [Image.new("RGB", (10, 10), color=(i * 40, 0, 0)) for i in range(3)]
+
+    paths = save_pages(iter(images), 3, tmp_path / "cache", "doc")
+
+    assert [p.name for p in paths] == [
+        "p000001-000003.png",
+        "p000002-000003.png",
+        "p000003-000003.png",
+    ]
+    assert [Image.open(p).getpixel((0, 0)) for p in paths] == [
+        (0, 0, 0),
+        (40, 0, 0),
+        (80, 0, 0),
+    ]
+
+
+def test_save_pages_raises_when_page_count_mismatch(tmp_path):
+    images = [Image.new("RGB", (10, 10)) for _ in range(2)]
+
+    with pytest.raises(RuntimeError):
+        save_pages(iter(images), 3, tmp_path / "cache", "doc")
+
+
+@pytest.mark.parametrize("n_pages", [0, 1_000_000])
+def test_save_pages_rejects_unnameable_page_count_before_rendering(tmp_path, n_pages):
+    def must_not_be_consumed():
+        raise AssertionError("pages must not be rendered")
+        yield  # pragma: no cover - makes this a generator
+
+    with pytest.raises(ValueError, match="doc"):
+        save_pages(must_not_be_consumed(), n_pages, tmp_path / "cache", "doc")
+
+
+def test_render_pages_tiff_streams_every_frame_in_order(tmp_path):
+    tif_path = tmp_path / "doc.tif"
+    _make_multiframe_tiff(tif_path, n_pages=3)
+
+    paths = render_pages(tif_path, tmp_path / "cache", "abc123")
+
+    assert [p.name for p in paths] == [
+        "p000001-000003.png",
+        "p000002-000003.png",
+        "p000003-000003.png",
+    ]
+    # each frame was built with a distinct green value (see _make_multiframe_tiff)
+    assert [Image.open(p).getpixel((0, 0)) for p in paths] == [
+        (0, 0, 0),
+        (0, 30, 0),
+        (0, 60, 0),
+    ]
 
 
 @requires_libreoffice

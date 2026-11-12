@@ -84,6 +84,8 @@ External tools are needed only for files that go to the VLM:
 
 **Scanned PDFs under `native`:** anydoc can't OCR, and doc2md never sends documents to FireCrawl's hosted OCR. A scanned or image-only PDF therefore fails with a message listing the pages that need OCR. Convert it with `--conversion-method auto` or `vlm` instead. TIFFs under `native` fail the same way, and a warning at startup lists them.
 
+**Large documents:** pages are rendered 25 at a time and OCR images are encoded only when a `--concurrency` slot is free, so peak memory stays at about 1 GB regardless of document size.
+
 **Failures and reruns:**
 
 - A file that can't be converted at all writes **no** `.md` and counts as `failed`. Examples: a render error, OCR failing on every page, or an anydoc error. The next run retries it automatically.

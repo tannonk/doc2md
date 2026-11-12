@@ -21,17 +21,21 @@ Processing is split into two stages that run one after the other:
 
   1. render_pages()
     - Renders and caches a full-resolution PNG per page/frame/slide
-        (page_image_cache/<file_hash>/pNNN-MMM.png). PDF pages go through
-        pdf2image (poppler's pdftoppm run as a subprocess); TIFF frames are read
-        directly; Office documents are converted to PDF via headless LibreOffice
-        first, then rendered the same way as PDF. 
+        (page_image_cache/<file_hash>/pNNNNNN-MMMMMM.png). PDF pages go through
+        pdf2image (poppler's pdftoppm run as a subprocess), a chunk of
+        DEFAULT_RENDER_CHUNK_PAGES at a time and saved as they arrive, so memory
+        stays flat however long the document is; TIFF frames are read and saved
+        one at a time; Office documents are converted to PDF via headless
+        LibreOffice first, then rendered the same way as PDF.
         This stage is synchronous and runs in the main thread.
         Files routed to "native" skip this stage entirely.
 
   2. Markdown conversion — async, per file:
     - "vlm": OCRs the cached pages via a vLLM server, concurrently across
         files and pages, gated by a single semaphore shared across the whole
-        run (--concurrency). Format-agnostic. A PDF page, a TIFF frame, and
+        run (--concurrency). Each page is shrunk and base64-encoded only once
+        it holds a semaphore slot, so at most --concurrency encoded images are
+        in memory at a time. Format-agnostic. A PDF page, a TIFF frame, and
         a LibreOffice-rendered Office page are all treated as a PNG on disk.
     - "native": anydoc.to_markdown() run directly against the original
         document. Warning this does NOT use OCR, and doesn't generate any 
@@ -87,6 +91,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -96,7 +101,7 @@ from urllib.parse import urljoin
 import anydoc
 import httpx
 from loguru import logger
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from pdf2image.exceptions import PDFInfoNotInstalledError, PopplerNotInstalledError
 from PIL import Image, ImageSequence
 from tenacity import (
@@ -125,6 +130,10 @@ CONVERSION_METHODS: tuple[str, ...] = ("auto", "vlm", "native")
 DEFAULT_REQUEST_TIMEOUT_S = 300  # generous: a full-page OCR decode can be slow
 DEFAULT_LIBREOFFICE_TIMEOUT_S = 120  # per-document LibreOffice conversion timeout
 DEFAULT_CACHE_DPI = 200  # fixed rendering resolution for cached PDF/Office
+# Pages rendered per poppler call, so peak memory depends on this and not on the
+# document length. Lower it if large-format scans run out of memory.
+DEFAULT_RENDER_CHUNK_PAGES = 25
+MAX_CACHED_PAGES = 999_999  # page-image cache names use 6 digits (pNNNNNN-MMMMMM.png)
 
 TIFF_SUFFIXES: frozenset[str] = frozenset({".tif", ".tiff"})
 # Born-digital formats that both anydoc ("native") and LibreOffice ("vlm") read.
@@ -282,6 +291,65 @@ def convert_office_to_pdf(doc_path: Path) -> Path:
         raise
 
 
+def pdf_page_count(pdf_path: Path) -> int:
+    """Return the number of pages in a PDF without rendering any of them."""
+    return int(pdfinfo_from_path(str(pdf_path))["Pages"])
+
+
+def iter_pdf_pages(
+    pdf_path: Path,
+    n_pages: int,
+    dpi: int = DEFAULT_CACHE_DPI,
+    chunk_pages: int = DEFAULT_RENDER_CHUNK_PAGES,
+) -> Iterator[Image.Image]:
+    """Yield the pages of a PDF in order, rendering chunk_pages at a time.
+
+    convert_from_path returns every page it renders as one in-memory list, so
+    rendering a long PDF in a single call needs RAM proportional to its page
+    count. Only one chunk is alive at a time here; the caller must save each
+    page as it arrives for memory to stay flat.
+    """
+    for first_page in range(1, n_pages + 1, chunk_pages):
+        last_page = min(first_page + chunk_pages - 1, n_pages)
+        yield from convert_from_path(
+            str(pdf_path), dpi=dpi, first_page=first_page, last_page=last_page
+        )
+
+
+def save_pages(
+    pages: Iterable[Image.Image], n_pages: int, cache_dir: Path, source_name: str
+) -> list[Path]:
+    """Save pages to cache_dir as pNNNNNN-MMMMMM.png and return the ordered paths.
+
+    n_pages is the expected total and is part of every file name, so it must
+    be known before the first page arrives. Checks it before saving anything.
+
+    Raises:
+        ValueError: n_pages is 0 or exceeds MAX_CACHED_PAGES.
+        RuntimeError: the iterable yields a different number of pages — a short
+            render would otherwise silently drop pages from the document.
+    """
+    if n_pages == 0:
+        raise ValueError(f"{source_name} has no pages/frames/slides to render")
+    if n_pages > MAX_CACHED_PAGES:
+        raise ValueError(
+            f"{source_name} has {n_pages} pages/frames/slides, "
+            f"exceeds {MAX_CACHED_PAGES:,} limit for page-image cache naming"
+        )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_paths: list[Path] = []
+    for i, page in enumerate(pages):
+        cache_path = cache_dir / f"p{i + 1:06d}-{n_pages:06d}.png"
+        page.save(cache_path, "PNG")
+        cache_paths.append(cache_path)
+    if len(cache_paths) != n_pages:
+        raise RuntimeError(
+            f"{source_name}: expected {n_pages} page(s) but rendered "
+            f"{len(cache_paths)} into {cache_dir}"
+        )
+    return cache_paths
+
+
 def render_pages(
     input_file: Path,
     page_image_cache_dir: Path,
@@ -291,49 +359,43 @@ def render_pages(
     """Render every page/frame/slide of input_file to a full-resolution PNG.
 
     Writes to the shared cache convention
-    page_image_cache_dir/<file_hash>/pNNN-MMM.png (required by
+    page_image_cache_dir/<file_hash>/pNNNNNN-MMMMMM.png (required by
     resolve.py, which derives this same subdirectory name from
     the output .md file's own stem) and returns the ordered list of cache
-    paths. Fully synchronous — see module docstring for why this stage
-    doesn't need concurrency.
+    paths. Pages are rendered and saved a chunk at a time, so peak memory
+    does not grow with document length. Fully synchronous — see module
+    docstring for why this stage doesn't need concurrency.
     """
     suffix = input_file.suffix.lower()
+    cache_dir = page_image_cache_dir / file_hash
+    name = input_file.name
     if suffix == ".pdf":
-        pages = convert_from_path(str(input_file), dpi=dpi)
+        n_pages = pdf_page_count(input_file)
+        cache_paths = save_pages(
+            iter_pdf_pages(input_file, n_pages, dpi), n_pages, cache_dir, name
+        )
     elif suffix in TIFF_SUFFIXES:
         # ImageSequence.Iterator re-seeks and yields the SAME underlying image
-        # object for every frame (still tied to the open file handle); .copy()
-        # forces each frame to materialize as an independent, decoded image
-        # before the file handle it depends on potentially gets reused.
-        pages = [
-            frame.copy() for frame in ImageSequence.Iterator(Image.open(input_file))
-        ]
+        # object for every frame, which is only safe because each frame is
+        # saved before the next seek.
+        with Image.open(input_file) as image:
+            n_pages = getattr(image, "n_frames", 1)  # absent on single-frame formats
+            cache_paths = save_pages(
+                ImageSequence.Iterator(image), n_pages, cache_dir, name
+            )
     elif suffix in OFFICE_SUFFIXES:
         pdf_path = convert_office_to_pdf(input_file)
         try:
-            pages = convert_from_path(str(pdf_path), dpi=dpi)
+            n_pages = pdf_page_count(pdf_path)
+            cache_paths = save_pages(
+                iter_pdf_pages(pdf_path, n_pages, dpi), n_pages, cache_dir, name
+            )
         finally:
             shutil.rmtree(pdf_path.parent, ignore_errors=True)
     else:
         raise ValueError(f"Unsupported file type: {input_file.suffix}")
 
-    n_pages = len(pages)
-    if n_pages == 0:
-        raise ValueError(f"{input_file.name} has no pages/frames/slides to render")
-    elif n_pages > 999_999:
-        raise ValueError(
-            f"{input_file.name} has {n_pages} pages/frames/slides, "
-            "exceeds 999,999 limit for page-image cache naming"
-        )
-    cache_paths = []
-    for i, page in enumerate(pages):
-        cache_path = (
-            page_image_cache_dir / file_hash / f"p{i + 1:06d}-{n_pages:06d}.png"
-        )
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        page.save(cache_path, "PNG")
-        cache_paths.append(cache_path)
-    logger.debug(f"{input_file.name}: rendered and cached {n_pages} page(s)")
+    logger.debug(f"{name}: rendered and cached {n_pages} page(s)")
     return cache_paths
 
 
@@ -403,8 +465,10 @@ async def convert_pages_vlm(
             img.save(buffer, format="PNG")
             return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        image_b64 = await asyncio.to_thread(_downscale_to_b64)
         async with sem:
+            # Inside the semaphore so at most --concurrency base64 images are
+            # alive at once, however many pages are waiting.
+            image_b64 = await asyncio.to_thread(_downscale_to_b64)
             try:
                 text = await ocr_page(
                     client,
